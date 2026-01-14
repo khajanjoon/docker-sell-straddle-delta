@@ -1,5 +1,4 @@
 import time
-import requests
 from datetime import datetime, timedelta, timezone
 
 from delta_rest_client import (
@@ -12,16 +11,14 @@ from delta_rest_client import (
 API_KEY = "TcwdPNNYGjjgkRW4BRIAnjL7z5TLyJ"
 API_SECRET = "B5ALo5Mh8mgUREB6oGD4oyX3y185oElaz1LoU6Y3X5ZX0s8TvFZcX4YTVToJ"
 
-STRIKE_INTERVAL = 200
-CHECK_INTERVAL = 5          # seconds
-ORDER_SIZE = 1
-ENTRY_OFFSET = 100           # mark_price - 100
-TARGET_MULTIPLIER = 0.5
-MIN_MARK_PRICE = 1000        # ✅ NEW CONDITION
-
-SEARCH_URL = "https://api.india.delta.exchange/v2/products/universal_search/mv"
 BASE_URL = "https://api.india.delta.exchange"
-# ==========================================
+
+STRIKE_INTERVAL = 200
+ITM_DISTANCE = 0          # 0 = ATM
+ORDER_SIZE = 1
+CHECK_INTERVAL = 5
+PRICE_OFFSET = 100
+# =========================================
 
 delta_client = DeltaRestClient(
     base_url=BASE_URL,
@@ -29,122 +26,166 @@ delta_client = DeltaRestClient(
     api_secret=API_SECRET
 )
 
-HEADERS = {
-    "Accept": "application/json",
-    "User-Agent": "Mozilla/5.0"
-}
-
 IST = timezone(timedelta(hours=5, minutes=30))
 
+# ---------- STRADDLE TRACKER ----------
+open_straddle = {
+    "call": None,
+    "put": None
+}
 
 # ---------- HELPERS ----------
 
 def get_expiry():
     now = datetime.now(IST)
     if now.hour > 17 or (now.hour == 17 and now.minute >= 30):
-        expiry_date = now.date() + timedelta(days=1)
+        expiry = now.date() + timedelta(days=3)
     else:
-        expiry_date = now.date()
-    return expiry_date.strftime("%d%m%y")
+        expiry = now.date() + timedelta(days=2)
+    return expiry.strftime("%d%m%y")
 
 
 def get_atm_strike(spot):
     return int(round(spot / STRIKE_INTERVAL) * STRIKE_INTERVAL)
 
 
-def fetch_mv_products():
-    r = requests.get(SEARCH_URL, headers=HEADERS, timeout=10)
-    r.raise_for_status()
-    data = r.json()
-    return {
-        p["symbol"]: p["product_id"]
-        for p in data["result"]["move_options"]["products"]
-        if p["underlying_asset_symbol"] == "BTC"
-    }
-
-
 def already_in_position(product_id):
     pos = delta_client.get_position(product_id)
-    if not pos or float(pos.get("size", 0)) == 0:
+    if not pos:
         return False
-    return True
+    return abs(float(pos.get("size", 0))) > 0
 
 
-# ---------- MAIN LOOP ----------
+def get_product_id(symbol):
+    product = delta_client.get_product(symbol)
+    return product["id"]
 
-print("🚀 Auto MV Straddle Bot Started")
+
+def load_existing_position(symbol, product_id):
+    pos = delta_client.get_position(product_id)
+    print("Loaded existing position:", pos)
+    if not pos:
+        return None
+
+    size = abs(float(pos.get("size", 0)))
+    if size == 0:
+        return None
+
+    return {
+        "symbol": symbol,
+        "product_id": product_id,
+        "entry_price": float(pos["entry_price"]),
+        "qty": size
+    }
+
+# ---------- MAIN ----------
+
+print("🚀 SELL STRADDLE + LIVE PnL STARTED")
 
 while True:
     try:
+        # ---------- LIVE PnL ----------
+        # ---------- LIVE PnL ----------
+        if open_straddle["call"] and open_straddle["put"]:
+         call_ticker = delta_client.get_ticker(open_straddle["call"]["symbol"])
+         put_ticker  = delta_client.get_ticker(open_straddle["put"]["symbol"])
+
+         call_ltp = float(call_ticker["mark_price"])
+         put_ltp  = float(put_ticker["mark_price"])
+
+         call_entry = float(open_straddle["call"]["entry_price"])
+         put_entry  = float(open_straddle["put"]["entry_price"])
+
+         call_qty = float(open_straddle["call"]["qty"])
+         put_qty  = float(open_straddle["put"]["qty"])
+
+         call_pnl = (call_entry - call_ltp) * call_qty
+         put_pnl  = (put_entry - put_ltp) * put_qty
+
+         total_pnl = call_pnl + put_pnl
+
+         print(
+        f"📈 PnL | CALL: {call_pnl:.2f} | "
+        f"PUT: {put_pnl:.2f} | "
+        f"TOTAL: {total_pnl:.2f}"
+      )
+
+
+        # ---------- ENTRY / DETECTION ----------
         expiry = get_expiry()
 
         btc = delta_client.get_ticker("BTCUSD")
         spot = float(btc["spot_price"])
         atm = get_atm_strike(spot)
 
-        strikes = [atm, atm + 200, atm - 200, atm + 400, atm - 400]
-        mv_products = fetch_mv_products()
+        call_strike = atm - ITM_DISTANCE
+        put_strike  = atm + ITM_DISTANCE
 
-        selected_symbol = None
-        selected_product_id = None
+        call_symbol = f"C-BTC-{call_strike}-{expiry}"
+        put_symbol  = f"P-BTC-{put_strike}-{expiry}"
 
-        for strike in strikes:
-            symbol = f"MV-BTC-{strike}-{expiry}"
-            if symbol in mv_products:
-                selected_symbol = symbol
-                selected_product_id = mv_products[symbol]
-                break
+        call_id = get_product_id(call_symbol)
+        put_id  = get_product_id(put_symbol)
 
-        if not selected_symbol:
-            print("❌ No MV found — retrying")
+        # ---- EXISTING STRADDLE DETECTION ----
+        if already_in_position(call_id) and already_in_position(put_id):
+            if not open_straddle["call"] and not open_straddle["put"]:
+                open_straddle["call"] = load_existing_position(call_symbol, call_id)
+                open_straddle["put"]  = load_existing_position(put_symbol, put_id)
+                print("🔄 Existing STRADDLE detected — LIVE PnL enabled")
+
             time.sleep(CHECK_INTERVAL)
             continue
 
-        print(f"\n📊 Spot: {spot} | ATM: {atm} | MV: {selected_symbol}")
-
-        if already_in_position(selected_product_id):
-            print("⚠️ Position already open — skipping")
+        # ---- IF STRADDLE ALREADY TRACKED, SKIP ENTRY ----
+        if open_straddle["call"] or open_straddle["put"]:
             time.sleep(CHECK_INTERVAL)
             continue
 
-        ticker = delta_client.get_ticker(selected_symbol)
-        raw_mark_price = float(ticker["mark_price"])
+        print(f"\n📊 Spot: {spot} | ATM: {atm}")
+        print(f"📞 CALL: {call_symbol}")
+        print(f"📉 PUT : {put_symbol}")
 
-        # ✅ MARK PRICE CONDITION
-        if raw_mark_price <= MIN_MARK_PRICE:
-            print(f"⛔ Mark price {raw_mark_price} <= {MIN_MARK_PRICE} — skipping trade")
-            time.sleep(CHECK_INTERVAL)
-            continue
+        call_ticker = delta_client.get_ticker(call_symbol)
+        put_ticker  = delta_client.get_ticker(put_symbol)
 
-        mark_price = raw_mark_price - ENTRY_OFFSET
+        call_price = round_by_tick_size(float(call_ticker["mark_price"]) - PRICE_OFFSET, 0.5)
+        put_price  = round_by_tick_size(float(put_ticker["mark_price"]) - PRICE_OFFSET, 0.5)
 
-        target_price = round_by_tick_size(
-            mark_price * TARGET_MULTIPLIER,
-            tick_size=0.5
-        )
-
-        order_sell = create_order_format(
-            product_id=selected_product_id,
+        call_order = create_order_format(
+            product_id=call_id,
             size=ORDER_SIZE,
             side="sell",
-            price=mark_price
+            price=call_price
         )
 
-        order_buy = create_order_format(
-            product_id=selected_product_id,
+        put_order = create_order_format(
+            product_id=put_id,
             size=ORDER_SIZE,
-            side="buy",
-            price=target_price
+            side="sell",
+            price=put_price
         )
 
-        delta_client.batch_create(
-            selected_product_id,
-            [order_sell, order_buy]
-        )
+        delta_client.batch_create(call_id, [call_order])
+        delta_client.batch_create(put_id, [put_order])
 
-        print(f"✅ Orders placed | SELL @ {mark_price} | BUY @ {target_price}")
+        open_straddle["call"] = {
+            "symbol": call_symbol,
+            "product_id": call_id,
+            "entry_price": call_price,
+            "qty": ORDER_SIZE
+        }
+
+        open_straddle["put"] = {
+            "symbol": put_symbol,
+            "product_id": put_id,
+            "entry_price": put_price,
+            "qty": ORDER_SIZE
+        }
+
+        print(f"✅ STRADDLE SOLD | CALL @ {call_price} | PUT @ {put_price}")
 
     except Exception as e:
         print("❌ Error:", e)
 
-    time.sleep(CHECK_INTERVAL)
+    time.sleep(CHECK_INTERVAL)  

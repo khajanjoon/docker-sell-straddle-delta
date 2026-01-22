@@ -13,11 +13,12 @@ API_SECRET = "B5ALo5Mh8mgUREB6oGD4oyX3y185oElaz1LoU6Y3X5ZX0s8TvFZcX4YTVToJ"
 
 BASE_URL = "https://api.india.delta.exchange"
 
-STRIKE_INTERVAL = 200
+STRIKE_INTERVAL = 1000
+STRIKE_DISTANCE = 8000
 ORDER_SIZE = 1
 CHECK_INTERVAL = 5
-PRICE_OFFSET = 100
-MIN_SELL_PRICE = 1000
+PRICE_OFFSET = 500
+MIN_MARK_PRICE = 10000     # ✅ NEW CONDITION
 # =========================================
 
 delta_client = DeltaRestClient(
@@ -31,11 +32,7 @@ IST = timezone(timedelta(hours=5, minutes=30))
 # ---------- HELPERS ----------
 
 def get_expiry():
-    now = datetime.now(IST)
-    if now.hour > 17 or (now.hour == 17 and now.minute >= 30):
-        expiry = now.date() + timedelta(days=3)
-    else:
-        expiry = now.date() + timedelta(days=2)
+    expiry = datetime(2026, 3, 27)
     return expiry.strftime("%d%m%y")
 
 
@@ -54,28 +51,16 @@ def position_exists(product_id):
     return abs(float(pos.get("size", 0))) > 0
 
 
-def get_straddle_status(atm, expiry):
-    """
-    Returns dict:
-    {
-        "call": True/False,
-        "put":  True/False
-    }
-    """
+def get_straddle_status(call_symbol, put_symbol):
     status = {"call": False, "put": False}
 
-    call_symbol = f"C-BTC-{atm}-{expiry}"
-    put_symbol  = f"P-BTC-{atm}-{expiry}"
-
     try:
-        call_id = get_product_id(call_symbol)
-        status["call"] = position_exists(call_id)
+        status["call"] = position_exists(get_product_id(call_symbol))
     except Exception:
         pass
 
     try:
-        put_id = get_product_id(put_symbol)
-        status["put"] = position_exists(put_id)
+        status["put"] = position_exists(get_product_id(put_symbol))
     except Exception:
         pass
 
@@ -83,76 +68,76 @@ def get_straddle_status(atm, expiry):
 
 
 # ---------- MAIN ----------
-print("🚀 SELL STRADDLE BOT STARTED")
+print("🚀 BUY STRADDLE BOT STARTED")
 
 while True:
     try:
-        # -------- MARKET DATA --------
         expiry = get_expiry()
 
         btc = delta_client.get_ticker("BTCUSD")
         spot = float(btc["spot_price"])
         atm = get_atm_strike(spot)
 
-        print(f"\n🔁 Spot {spot} | ATM {atm} | Expiry {expiry}")
+        call_strike = atm - STRIKE_DISTANCE
+        put_strike  = atm + STRIKE_DISTANCE
 
-        # -------- CHECK STRADDLE STATUS --------
-        status = get_straddle_status(atm, expiry)
+        call_symbol = f"C-BTC-{call_strike}-{expiry}"
+        put_symbol  = f"P-BTC-{put_strike}-{expiry}"
 
-        if status["call"] and status["put"]:
-            print("✅ CALL & PUT already exist — skipping both")
-            time.sleep(CHECK_INTERVAL)
-            continue
+        print(f"\n🔁 Spot {spot} | ATM {atm}")
+        print(f"📌 CALL {call_strike} | PUT {put_strike} | Expiry {expiry}")
 
-        call_symbol = f"C-BTC-{atm}-{expiry}"
-        put_symbol  = f"P-BTC-{atm}-{expiry}"
+        status = get_straddle_status(call_symbol, put_symbol)
 
-        call_id = get_product_id(call_symbol)
-        put_id  = get_product_id(put_symbol)
-
-        call_ticker = delta_client.get_ticker(call_symbol)
-        put_ticker  = delta_client.get_ticker(put_symbol)
-
-        call_price = round_by_tick_size(
-            float(call_ticker["mark_price"]) - PRICE_OFFSET, 0.5
-        )
-        put_price = round_by_tick_size(
-            float(put_ticker["mark_price"]) - PRICE_OFFSET, 0.5
-        )
-
-        # -------- PLACE CALL --------
+        # -------- BUY CALL --------
         if not status["call"]:
-            if float(call_ticker["mark_price"]) > MIN_SELL_PRICE:
+            call_id = get_product_id(call_symbol)
+            call_ticker = delta_client.get_ticker(call_symbol)
+            call_mark = float(call_ticker["mark_price"])
+
+            if call_mark >= MIN_MARK_PRICE:
+                call_price = round_by_tick_size(
+                    call_mark + PRICE_OFFSET, 0.5
+                )
+
                 call_order = create_order_format(
                     product_id=call_id,
                     size=ORDER_SIZE,
-                    side="sell",
-                    price=float(call_price)
+                    side="buy",
+                    price=call_price
                 )
-                print("📉 Placing CALL order")
-                delta_client.batch_create(call_id, [call_order])
-                print(f"✅ CALL SOLD | {call_symbol} @ {call_price}")
-            else:
-                print("⚠️ CALL price too low — skipped")
-        else:
-            print("⏭️ CALL already exists — skipped")
 
-        # -------- PLACE PUT --------
+                delta_client.batch_create(call_id, [call_order])
+                print(f"✅ CALL BOUGHT | {call_symbol} @ {call_price}")
+            else:
+                print(f"⚠️ CALL skipped (mark {call_mark} < {MIN_MARK_PRICE})")
+        else:
+            print("⏭️ CALL already exists")
+
+        # -------- BUY PUT --------
         if not status["put"]:
-            if float(put_ticker["mark_price"]) > MIN_SELL_PRICE:
+            put_id = get_product_id(put_symbol)
+            put_ticker = delta_client.get_ticker(put_symbol)
+            put_mark = float(put_ticker["mark_price"])
+
+            if put_mark >= MIN_MARK_PRICE:
+                put_price = round_by_tick_size(
+                    put_mark + PRICE_OFFSET, 0.5
+                )
+
                 put_order = create_order_format(
                     product_id=put_id,
                     size=ORDER_SIZE,
-                    side="sell",
-                    price=float(put_price)
+                    side="buy",
+                    price=put_price
                 )
-                print("📉 Placing PUT order")
+
                 delta_client.batch_create(put_id, [put_order])
-                print(f"✅ PUT SOLD | {put_symbol} @ {put_price}")
+                print(f"✅ PUT BOUGHT | {put_symbol} @ {put_price}")
             else:
-                print("⚠️ PUT price too low — skipped")
+                print(f"⚠️ PUT skipped (mark {put_mark} < {MIN_MARK_PRICE})")
         else:
-            print("⏭️ PUT already exists — skipped")
+            print("⏭️ PUT already exists")
 
     except Exception as e:
         print("❌ Error:", e)
